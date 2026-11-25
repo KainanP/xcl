@@ -10006,3 +10006,71 @@ fn gpu_v_dot8_u32_u4_edge_cases() {
         }
     }
 }
+
+#[test]
+fn gpu_dot4_constant_multiplicands() {
+    if !gpu_ready() {
+        return;
+    }
+    // v_dot4_{i32_i8,u32_u8}, v_dot4c_i32_i8 and v_dot8_u32_u4 with one multiplicand a compile-time
+    // constant (inline integer, literal, inline float) and the other operand and the accumulator from
+    // registers: the constant reaches `dot4AddPacked` as an immediate. Lanes 0..3 are checked.
+    // (source code, literal, value)
+    let mut ks: Vec<(u64, Option<u32>, u32)> = Vec::new();
+    for k in [1u64, 2, 15, 16, 63, 64] {
+        ks.push((128 + k, None, k as u32));
+    }
+    for k in [1u64, 2, 16] {
+        ks.push((192 + k, None, (-(k as i32)) as u32));
+    }
+    for lit in [0x4000u32, 0x7F00, 0xFF80, 0xFFFF_8000, 0x0080_0000, 0x1234_5678, 0x0002_0003] {
+        ks.push((255, Some(lit), lit));
+    }
+    for c in 240u64..=248 {
+        let v = match c { 240 => 0.5f32, 241 => -0.5, 242 => 1.0, 243 => -1.0, 244 => 2.0, 245 => -2.0, 246 => 4.0, 247 => -4.0, _ => 0.159_154_94 };
+        ks.push((c, None, v.to_bits()));
+    }
+    let mut code = Vec::new();
+    let e = |n: &str, enc: &str, f: &[(&str, u64)], l: Option<u32>| encode(n, enc, f, l).unwrap_or_else(|x| panic!("{n}: {x}"));
+    let base = 8u64;
+    for (i, &(src, lit, _)) in ks.iter().enumerate() {
+        let d = base + 5 * i as u64;
+        code.extend(e("V_DOT4_I32_I8", "ENC_VOP3P", &[("VDST", d), ("SRC0", V), ("SRC1", src), ("SRC2", V + 1), ("OP_SEL_HI", 3), ("OP_SEL_HI_2", 1)], lit));
+        code.extend(e("V_DOT4_I32_I8", "ENC_VOP3P", &[("VDST", d + 1), ("SRC0", src), ("SRC1", V), ("SRC2", V + 1), ("OP_SEL_HI", 3), ("OP_SEL_HI_2", 1)], lit));
+        code.extend(e("V_DOT4_U32_U8", "ENC_VOP3P", &[("VDST", d + 2), ("SRC0", V), ("SRC1", src), ("SRC2", V + 1), ("OP_SEL_HI", 3), ("OP_SEL_HI_2", 1)], lit));
+        code.extend(e("V_MOV_B32", "ENC_VOP1", &[("VDST", d + 3), ("SRC0", V + 1)], None));
+        code.extend(e("V_DOT4C_I32_I8", "ENC_VOP2", &[("VDST", d + 3), ("SRC0", src), ("VSRC1", 0)], lit));
+        code.extend(e("V_DOT8_U32_U4", "ENC_VOP3P", &[("VDST", d + 4), ("SRC0", V), ("SRC1", src), ("SRC2", V + 1), ("OP_SEL_HI", 3), ("OP_SEL_HI_2", 1)], lit));
+    }
+    code.extend(e("S_ENDPGM", "ENC_SOPP", &[], None));
+    let si = |a: u32, b: u32, c: u32| -> u32 { (0..4).fold(c as i32, |r, k| r.wrapping_add(((a >> (8 * k)) as u8 as i8 as i32) * ((b >> (8 * k)) as u8 as i8 as i32))) as u32 };
+    let ui = |a: u32, b: u32, c: u32| -> u32 { (0..4).fold(c, |r, k| r.wrapping_add(((a >> (8 * k)) & 0xFF) * ((b >> (8 * k)) & 0xFF))) };
+    let ins = [(0x0705_FB82u32, 0x7FFF_FFF0u32), (0x0302_FB02, 100), (0x8081_7F01, 0xFFFF_0000), (0xFFFF_FFFF, 0)];
+    for wave64 in gpu_waves() {
+        let mut st = KernelState::default();
+        for (l, r) in st.vgpr.iter_mut().enumerate() {
+            (r[0], r[1]) = ins[l % 4];
+        }
+        let (r, lanes) = run_wave(&code, &st, wave64);
+        let mut bad = Vec::new();
+        for (l, v) in r.vgpr.iter().take(lanes).enumerate() {
+            let (a, c) = ins[l % 4];
+            for (i, &(src, _, k)) in ks.iter().enumerate() {
+                let d = (base + 5 * i as u64) as usize;
+                let u4 = (0..8).fold(c, |r: u32, q| r.wrapping_add(((a >> (4 * q)) & 0xF) * ((k >> (4 * q)) & 0xF)));
+                let want = [si(a, k, c), si(k, a, c), ui(a, k, c), si(k, a, c), u4];
+                for (j, op) in ["i8 src1", "i8 src0", "u8 src1", "dot4c src0", "u4 dot8 src1"].iter().enumerate() {
+                    if v[d + j] != want[j] && l < 4 {
+                        bad.push(format!("lane {l} {op} k={k:#x} (code {src}): got {:#x} want {:#x}", v[d + j], want[j]));
+                    }
+                }
+            }
+        }
+        println!("adapter {:?} wave{lanes}: {} mismatches", runner::adapter(), bad.len());
+        for b in &bad {
+            println!("  {b}");
+        }
+        assert!(bad.is_empty());
+    }
+}
+
